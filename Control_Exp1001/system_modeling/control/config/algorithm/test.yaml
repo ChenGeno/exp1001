@@ -1,3 +1,0 @@
-name: test
-default_action: 90
-length: 50 # help="The length of optimized sequence for planning"

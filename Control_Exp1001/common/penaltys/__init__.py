@@ -1,2 +1,0 @@
-
-from .quadratic import Quadratic

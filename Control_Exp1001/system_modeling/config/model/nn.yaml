@@ -1,7 +1,0 @@
-# @package _group_
-type: nn
-h_size: 16
-num_layers: 1
-
-
-
