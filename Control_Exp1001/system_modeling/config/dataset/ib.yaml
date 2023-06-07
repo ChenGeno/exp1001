@@ -1,0 +1,11 @@
+# @package _group_
+type: ib
+input_size: 3
+observation_size: 6
+dataset_window: 5
+train_path: data/ib/ibState_train.csv
+val_path: data/ib/ibState_val.csv
+test_path: data/ib/ibState_test.csv
+target_names: ['v', 'g', 'h', 'fatigue', 'consumption', 'reward']
+history_length: 60
+forward_length: 120

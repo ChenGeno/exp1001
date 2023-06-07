@@ -1,0 +1,4 @@
+object,
+thickener_simulation_6000_test.csv
+thickener_simulation_20000_train.csv
+thickener_simulation_6000_val.csv
