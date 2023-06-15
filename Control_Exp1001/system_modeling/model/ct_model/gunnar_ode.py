@@ -45,29 +45,39 @@ class GunnarODE(nn.Module, BaseModel):
         self.cde_func = NCDEFunc(h_size, u_size+1, batch_size=512)
         self.interpolation = interpolation
         self.encoder = torch.nn.Linear(u_size+1, h_size)
-        self.decoder = torch.nn.Linear(h_size, y_size)
+        # self.decoder = torch.nn.Linear(h_size, y_size)
 
-    def forward(self, ts, us, ys, batch_size):
+
+        # RNN相关
+        self.process_u = PreProcess(self.u_size, h_size)
+        self.process_x = PreProcess(y_size, h_size)
+        self.Ly_gauss = DBlock(2 * h_size, 2 * h_size, y_size)
+        self.rnn_encoder = torch.nn.GRU(2 * h_size, h_size, 1)
+        self.decoder = MLP(h_size, 2 * h_size, y_size, 1)
+        # self.rnn_cell = nn.GRUCell(
+        #     h_size*2,
+        #     h_size*2
+        # )
+
+    def forward(self, ts, us, h0):
 
         # 预处理，维度适应, 从(l, batch, v) -> (batch, l, v)
         ts = ts.permute(1, 0, 2)
         us = us.permute(1, 0, 2)
-        # TODO：Ys在这里暂时完全没用，后来可能用于确定初值
-        ys = ys.permute(1, 0, 2)
 
 
         x = torch.cat([ts, us], dim=2)
         coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(x)
         X = torchcde.CubicSpline(coeffs)
 
-        # TODO: 定义y0（z0）
-        # z0 = ys[:, 0, :]
-        z0 = torch.zeros(batch_size, self.u_size+1).to(us)
-        z0 = self.encoder(z0)
+        # # TODO: 定义y0（z0）
+        # # z0 = ys[:, 0, :]
+        # z0 = torch.zeros(batch_size, self.u_size+1).to(us)
+        # z0 = self.encoder(z0)
 
         ys_predict = torchcde.cdeint(X=X,
                              func=self.cde_func,
-                             z0=z0,
+                             z0=h0,
                              t=ts.squeeze(-1)[0, :])  # 每个batch的t序列是相等的，取第0维
 
         ys_predict = self.decoder(ys_predict)
@@ -78,24 +88,58 @@ class GunnarODE(nn.Module, BaseModel):
 
 
     def _forward_posterior(self, external_input_seq, observations_seq, memory_state=None):
-        #
+        l, batch_size, _ = external_input_seq.size()
+        external_input_seq, dt = external_input_seq[..., :-1], external_input_seq[..., -1:]
+
+        external_input_seq_embed = self.process_u(external_input_seq)
+        observations_seq_embed = self.process_x(observations_seq)
+
+        hn = torch.zeros((batch_size, self.h_size),
+                         device=external_input_seq.device) if memory_state is None else memory_state['hn']
+
+        h_seq = [hn]
+        x_seq = []
+        for t in range(l):
+            # encoder网络更新h_t: u_t+1, x_t+1, h_t -> h_t+1 u_t, x_t, h_t -> h_{t+1}
+            output, _ = self.rnn_encoder(
+                torch.cat([external_input_seq_embed[t], observations_seq_embed[t]], dim=-1).unsqueeze(dim=0),
+                hn.unsqueeze(dim=0)
+            )
+            hn = output[0]
+            # x重构 for loss
+            x_t = self.decoder(hn)
+
+            h_seq.append(hn)
+            x_seq.append(x_t)
+
+        h_seq = torch.stack(h_seq, dim=0)
+        h_seq = h_seq[:-1]
+        x_seq = torch.stack(x_seq, dim=0)
+
         outputs = {
-            'state_mu': observations_seq,
-            'state_logsigma': -torch.ones_like(observations_seq) * float('inf'),
+            'state_mu': x_seq,
+            'state_logsigma': -torch.ones_like(x_seq) * float('inf'),
+            'h_seq': h_seq,
+            'x_seq': x_seq,
+            'observations_seq_embed': observations_seq_embed,
         }
 
-        pred_next_ob = observations_seq[-1]
+        return outputs, {'hn': hn}
 
-        return outputs, {'yn': pred_next_ob}
 
-    def _forward_prediction(self, external_input_seq, n_traj=16, memory_state=None):
+    def _forward_prediction(self, external_input_seq, n_traj=1, memory_state=None):
         l, batch_size, _ = external_input_seq.size()
+        input_n_traj = n_traj
+        n_traj = 1
+
         external_input_seq, dt = external_input_seq[..., :-1], external_input_seq[..., -1:]
         ts = dt2ts(dt)
 
-        y0 = torch.zeros(batch_size, self.u_size+1).to(external_input_seq)
-        y0 = y0.repeat(n_traj, 1)
-        ys = self.forward(ts, repeat_tail(external_input_seq), repeat_tail(external_input_seq), batch_size)
+        hn = zeros_like_with_shape(external_input_seq, (batch_size, self.h_size)
+                                   ) if memory_state is None else memory_state['hn']
+
+
+        ys = self.forward(ts, repeat_tail(external_input_seq), hn)
         ys, y = ys[:-1], ys[-1, :batch_size]
         predicted_seq = ys
         predicted_dist = MultivariateNormal(
@@ -113,14 +157,30 @@ class GunnarODE(nn.Module, BaseModel):
 
     def call_loss(self, external_input_seq, observations_seq, memory_state=None):
         l, batch_size, _ = observations_seq.shape
-        external_input_seq, dt = external_input_seq[..., :-1], external_input_seq[..., -1:]
-        ts = dt2ts(dt)
-        ys = self.forward(ts, repeat_tail(external_input_seq), repeat_tail(observations_seq), batch_size)  # repeat_tail：(241, 512, 1) -> (240, 512, 1)
-        ys = ys[:-1]
+        # external_input_seq, dt = external_input_seq[..., :-1], external_input_seq[..., -1:]
+
+        train_pred_len = int(len(external_input_seq) / 2)
+        historical_input = external_input_seq[:train_pred_len]
+        historical_ob = observations_seq[:train_pred_len]
+        future_input_and_dt = external_input_seq[train_pred_len:]
+        future_ob = observations_seq[train_pred_len:]
+
+        outputs, memory_state = self.forward_posterior(historical_input, historical_ob, memory_state)
+        posterior_x_seq = outputs['x_seq']
+
+        # outputs, memory_state = self.forward_prediction(future_input, memory_state=memory_state, grad=True)
+
+        # ts = dt2ts(dt[train_pred_len:])
+        # ys = self.forward(ts, repeat_tail(future_input), repeat_tail(future_ob), memory_state['hn'], batch_size)  # repeat_tail：(241, 512, 1) -> (240, 512, 1)
+        ys_outputs, y = self.forward_prediction(future_input_and_dt, memory_state=memory_state, grad=True)
+        ys = ys_outputs['predicted_seq']
+        # ys = ys[:-1]
+
+        predicted_seq = torch.cat([posterior_x_seq, ys], dim=0)
 
         # MSE
         return {
-            'loss': F.mse_loss(ys, observations_seq),  # TODO: observations_seq[1:]
+            'loss': F.mse_loss(predicted_seq, observations_seq),  # TODO: observations_seq[1:]
             'kl_loss': 0,
             'likelihood_loss': 0
         }

@@ -548,7 +548,8 @@ def main_app(args: DictConfig) -> None:
         raise AttributeError('It should specify save_dir attribute in test mode!')
 
     # ckpt_path = '/code/SE-VAE/ckpt/southeast/seq2seq/seq2seq_ctrl_solution=2/2021-06-12_23-06-08'
-    # ckpt_path = '/code/SE-VAE/ckpt/southeast/tmp/vaecl_/2021-06-18_20-52-31'
+    # ckpt_path = 'C:\\Users\\10788\\Desktop\\code\\exp1001\\Control_Exp1001\\system_modeling\\ckpt\\cstr\\ct_True\\debug\\gunnar_ode_ct_time=true,random_seed=0,sp=1\\2023-06-14_23-41-33'
+
     ckpt_path = args.test.test_dir
 
     logging = SimpleLogger(os.path.join(ckpt_path, 'test.out'))
